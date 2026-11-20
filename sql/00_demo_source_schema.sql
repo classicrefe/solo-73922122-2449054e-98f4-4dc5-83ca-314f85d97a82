@@ -10,6 +10,9 @@
 --   employee.mentor_id ─► employee.emp_id       (self reference)
 --   project (dept_id, dept_code) MATCH FULL ─► dept (dept_id, dept_code)
 --   assignment (emp_id, project_id) ─► employee / project, composite UK
+--
+-- Domain pair for the row-count conflict worked example:
+--   inspection_report.registration_no (NOT NULL) ─► registration.reg_no
 -- ============================================================
 
 DROP SCHEMA IF EXISTS public CASCADE;
@@ -71,3 +74,26 @@ ALTER TABLE dept
     ADD CONSTRAINT dept_mgr_fk FOREIGN KEY (mgr_emp)
         REFERENCES employee (emp_id) MATCH SIMPLE
         ON DELETE SET NULL ON UPDATE CASCADE NOT DEFERRABLE;
+
+-- ============================================================
+-- Domain pair: lab inspection reports must reference a
+-- registration. registration_no is NOT NULL, so a report row is
+-- impossible whenever the registration table is generated empty.
+-- Used by examples/request_zero_parent_rows.json.
+-- ============================================================
+
+CREATE TABLE registration (
+    reg_no        integer NOT NULL,
+    batch_code    smallint NOT NULL,
+    CONSTRAINT registration_pk PRIMARY KEY (reg_no)
+);
+
+CREATE TABLE inspection_report (
+    report_id        integer NOT NULL,
+    registration_no  integer NOT NULL,
+    result_code      integer,
+    CONSTRAINT inspection_report_pk PRIMARY KEY (report_id),
+    CONSTRAINT inspection_report_reg_fk FOREIGN KEY (registration_no)
+        REFERENCES registration (reg_no) MATCH SIMPLE
+        ON DELETE RESTRICT ON UPDATE CASCADE NOT DEFERRABLE
+);

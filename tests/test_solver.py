@@ -13,6 +13,7 @@ from app.models import (
     UniqueConstraint,
 )
 from app.solver import Generator, Unsatisfiable
+import app.solver as solver_mod
 
 
 def col(name, pg_type="integer", nullable=False):
@@ -241,44 +242,77 @@ def test_match_simple_allows_mixed_null():
 
 
 def test_match_simple_vs_full_mixed_null_distinction():
-    """A scenario feasible only if mixed NULL composite keys are allowed."""
-    # Child has more rows than the parent has distinct full keys, and the
-    # non-null intervals cannot supply enough distinct full keys; mixed-NULL
-    # rows provide the extra capacity under SIMPLE but are banned under FULL.
-    parent, child_simple = _composite_table(MatchType.SIMPLE)
-    _, child_full = _composite_table(MatchType.FULL)
-    # f1 single-point, f2 single-point => at most one distinct non-NULL key.
-    tight = {
-        "p": spec("p", 1, {"k1": (1, 1), "k2": (10, 10)}),
-        "c": spec("c", 3, {"id": (100, 102), "f1": (1, 1), "f2": (10, 10)}),
-    }
-    # FULL: every non-all-NULL row must match the single parent key; that is
-    # still feasible without NULLs, so instead force NULL usage via a unique
-    # index on the FK columns to expose the distinction.
-    child_simple.unique_constraints.append(
-        UniqueConstraint(name="uk_fk", columns=["f1", "f2"], is_primary=False)
-    )
-    child_full.unique_constraints.append(
-        UniqueConstraint(name="uk_fk", columns=["f1", "f2"], is_primary=False)
-    )
-    need_null = {
-        "p": spec("p", 1, {"k1": (1, 1), "k2": (10, 10)}),
-        # 4 child rows but only one non-NULL distinct (f1,f2); the rest must be
-        # NULL-bearing. SIMPLE permits mixed (f1=NULL,f2=10); FULL does not.
-        "c": spec("c", 4, {"id": (100, 103), "f1": (1, 1), "f2": (10, 10)}),
-    }
-    simple_out = Generator({"p": parent, "c": child_simple}, need_null).solve()
-    mixed_seen = any(
-        (r["f1"] is None) != (r["f2"] is None) for r in simple_out["c"]
-    )
-    assert mixed_seen, "MATCH SIMPLE should admit a mixed-NULL composite key"
+    """Deterministic SIMPLE-vs-FULL distinction on a forced mixed-NULL key.
 
-    # Under FULL the same request must be unsat: FULL only allows all-NULL keys
-    # (which satisfy the unique index via NULL-distinctness) — verify FULL never
-    # emits a mixed key even when it finds a solution.
-    full_out = Generator({"p": parent, "c": child_full}, tight).solve()
-    for r in full_out["c"]:
-        assert (r["f1"] is None) == (r["f2"] is None)
+    The second FK column ``f2`` is NOT NULL, so an all-NULL key is impossible:
+    a row whose ``f1`` is NULL while ``f2`` keeps its value is necessarily a
+    *mixed* key. MATCH SIMPLE exempts mixed keys from the lookup, so the
+    instance is feasible; MATCH FULL forbids mixed keys outright, so the very
+    same instance is unsatisfiable. This avoids relying on which of several
+    equally-valid NULL placements z3 happens to return.
+    """
+    parent = TableSchema(
+        schema_name="public",
+        name="p",
+        columns=[col("k1"), col("k2")],
+        unique_constraints=[
+            UniqueConstraint(name="pk_p", columns=["k1", "k2"], is_primary=True)
+        ],
+        foreign_keys=[],
+    )
+
+    def child_with(match: MatchType):
+        return TableSchema(
+            schema_name="public",
+            name="c",
+            # f1 nullable, f2 NOT NULL: a NULL f1 forces a mixed (never
+            # all-NULL) composite key.
+            columns=[col("id"), col("f1", nullable=True), col("f2")],
+            unique_constraints=[
+                UniqueConstraint(name="pk_c", columns=["id"], is_primary=True),
+                # Two non-NULL identical (f1, f2) keys would collide, forcing the
+                # second single-point row onto a NULL-bearing (mixed) key.
+                UniqueConstraint(name="uk_fk", columns=["f1", "f2"], is_primary=False),
+            ],
+            foreign_keys=[
+                ForeignKey(
+                    name="fk_c_p",
+                    columns=["f1", "f2"],
+                    ref_table="p",
+                    ref_columns=["k1", "k2"],
+                    match=match,
+                    on_update="NO ACTION",
+                    on_delete="NO ACTION",
+                    not_deferrable=True,
+                    initially_deferred=False,
+                )
+            ],
+        )
+
+    specs = {
+        "p": spec("p", 1, {"k1": (1, 1), "k2": (10, 10)}),
+        # Two child rows: one matches the single parent key; the other cannot
+        # reuse it (single-point intervals) and must place f1 = NULL.
+        "c": spec("c", 2, {"id": (100, 101), "f1": (1, 1), "f2": (10, 10)}),
+    }
+
+    # MATCH SIMPLE: the mixed-NULL row is exempt, so a solution exists and it
+    # necessarily contains exactly one mixed key (f1 NULL, f2 non-NULL).
+    simple_out = Generator(
+        {"p": parent, "c": child_with(MatchType.SIMPLE)}, specs
+    ).solve()
+    mixed = [
+        r for r in simple_out["c"] if (r["f1"] is None) != (r["f2"] is None)
+    ]
+    assert len(mixed) == 1
+    assert mixed[0]["f1"] is None and mixed[0]["f2"] == 10
+
+    # MATCH FULL: mixed keys are forbidden and all-NULL is impossible
+    # (f2 NOT NULL), so no valid placement for the second row -> unsat.
+    with pytest.raises(Unsatisfiable):
+        Generator(
+            {"p": parent, "c": child_with(MatchType.FULL)}, specs
+        ).solve()
 
 
 def test_zero_rows_table():
@@ -304,3 +338,259 @@ def test_type_bounds_enforced():
     )
     with pytest.raises(ValueError):
         IntRange(low=-40000, high=1).validated(ts.column("id"))
+
+
+# ---------------------------------------------------------------------------
+# Row-count conflict diagnosis: the labelled unsat core alone never contains
+# a rows group (the count is encoded structurally), so a dedicated
+# counterfactual analysis must surface the counts that make the instance
+# infeasible while excluding counts that play no part.
+# ---------------------------------------------------------------------------
+
+def _parent_child_schemas(nullable_fk=False):
+    parent = TableSchema(
+        schema_name="public",
+        name="registration",
+        columns=[col("reg_no"), col("batch_code", pg_type="smallint")],
+        unique_constraints=[
+            UniqueConstraint(name="registration_pk", columns=["reg_no"], is_primary=True)
+        ],
+        foreign_keys=[],
+    )
+    child = TableSchema(
+        schema_name="public",
+        name="inspection_report",
+        columns=[
+            col("report_id"),
+            col("registration_no", nullable=nullable_fk),
+            col("result_code", nullable=True),
+        ],
+        unique_constraints=[
+            UniqueConstraint(
+                name="inspection_report_pk", columns=["report_id"], is_primary=True
+            )
+        ],
+        foreign_keys=[
+            ForeignKey(
+                name="inspection_report_reg_fk",
+                columns=["registration_no"],
+                ref_table="registration",
+                ref_columns=["reg_no"],
+                match=MatchType.SIMPLE,
+                on_update="CASCADE",
+                on_delete="RESTRICT",
+                not_deferrable=True,
+                initially_deferred=False,
+            )
+        ],
+    )
+    return parent, child
+
+
+def test_zero_parent_rows_with_required_fk_names_both_row_counts():
+    parent, child = _parent_child_schemas()
+    schemas = {"registration": parent, "inspection_report": child}
+    specs = {
+        "registration": spec(
+            "registration", 0, {"reg_no": (8000, 8999), "batch_code": (1, 99)}
+        ),
+        "inspection_report": spec(
+            "inspection_report",
+            1,
+            {"report_id": (5000, 5999), "registration_no": (8000, 8999), "result_code": (1, 9)},
+        ),
+    }
+    with pytest.raises(Unsatisfiable) as exc:
+        Generator(schemas, specs).solve()
+    unsat = exc.value
+    row_tables = {g.refs[0] for g in unsat.row_groups}
+    assert row_tables == {"registration", "inspection_report"}
+    assert unsat.row_diagnosis == "complete"
+    labels = " ".join(g.label for g in unsat.row_groups)
+    assert "恰好 0 行" in labels and "恰好 1 行" in labels
+    # Original constraints stay in the explanation; nothing is weakened.
+    kinds = {g.kind for g in unsat.groups}
+    assert "fk" in kinds and "range" in kinds
+    fk_labels = [g.label for g in unsat.groups if g.kind == "fk"]
+    assert any("inspection_report_reg_fk" in x for x in fk_labels)
+
+
+def test_nullable_fk_with_zero_parent_rows_is_sat_via_null():
+    # Same cardinalities, but the FK column is nullable: NULL exempts the row,
+    # so a 1-row child against a 0-row parent must remain feasible and must not
+    # be reported as a row-count conflict.
+    parent, child = _parent_child_schemas(nullable_fk=True)
+    schemas = {"registration": parent, "inspection_report": child}
+    specs = {
+        "registration": spec(
+            "registration", 0, {"reg_no": (8000, 8999), "batch_code": (1, 99)}
+        ),
+        "inspection_report": spec(
+            "inspection_report",
+            1,
+            {"report_id": (5000, 5999), "registration_no": (8000, 8999), "result_code": (1, 9)},
+        ),
+    }
+    out = Generator(schemas, specs).solve()
+    assert out["inspection_report"][0]["registration_no"] is None
+
+
+def test_row_count_diagnosis_excludes_unrelated_table():
+    # Three tables: p (parent), c (NOT NULL FK -> p), bystander (no relations
+    # to either). c=1 vs p=0 is unsat; the bystander's requested row count must
+    # never appear in the row-count conflict set, whatever count it requests.
+    parent, child = _parent_child_schemas()
+    bystander = TableSchema(
+        schema_name="public",
+        name="bystander",
+        columns=[col("id")],
+        unique_constraints=[UniqueConstraint(name="bystander_pk", columns=["id"], is_primary=True)],
+        foreign_keys=[],
+    )
+    schemas = {
+        "registration": parent,
+        "inspection_report": child,
+        "bystander": bystander,
+    }
+    specs = {
+        "registration": spec(
+            "registration", 0, {"reg_no": (8000, 8999), "batch_code": (1, 99)}
+        ),
+        "inspection_report": spec(
+            "inspection_report",
+            1,
+            {"report_id": (5000, 5999), "registration_no": (8000, 8999), "result_code": (1, 9)},
+        ),
+        "bystander": spec("bystander", 7, {"id": (1, 20)}),
+    }
+    with pytest.raises(Unsatisfiable) as exc:
+        Generator(schemas, specs).solve()
+    row_tables = {g.refs[0] for g in exc.value.row_groups}
+    assert row_tables == {"registration", "inspection_report"}
+    assert "bystander" not in row_tables
+
+
+def test_cardinality_range_conflict_names_the_row_count():
+    # 5 distinct PK ids requested from a 2-value interval: relaxing the row
+    # count alone restores feasibility (2 rows fit), so the requested row
+    # count genuinely participates and must be named alongside range/UK.
+    ts = TableSchema(
+        schema_name="public",
+        name="t",
+        columns=[col("id")],
+        unique_constraints=[UniqueConstraint(name="pk", columns=["id"], is_primary=True)],
+        foreign_keys=[],
+    )
+    specs = {"t": spec("t", 5, {"id": (1, 2)})}
+    with pytest.raises(Unsatisfiable) as exc:
+        Generator({"t": ts}, specs).solve()
+    unsat = exc.value
+    assert unsat.row_diagnosis == "complete"
+    assert [g.refs[0] for g in unsat.row_groups] == ["t"]
+    assert {g.kind for g in unsat.groups} >= {"unique", "range"}
+
+
+def test_range_disjoint_fk_keeps_child_count_and_prunes_unrelated():
+    # The FK intervals are disjoint and both requested counts are positive.
+    # Relaxing the child count alone makes the system satisfiable (it may
+    # choose 0 child rows), so the child's requested count participates;
+    # relaxing only the parent cannot help (disjoint intervals stay disjoint),
+    # so the parent's count is pruned. An independent bystander table is
+    # pruned as well regardless of its requested count.
+    parent, child = _parent_child_schemas()
+    bystander = TableSchema(
+        schema_name="public",
+        name="bystander",
+        columns=[col("id")],
+        unique_constraints=[
+            UniqueConstraint(name="bystander_pk", columns=["id"], is_primary=True)
+        ],
+        foreign_keys=[],
+    )
+    schemas = {
+        "registration": parent,
+        "inspection_report": child,
+        "bystander": bystander,
+    }
+    specs = {
+        "registration": spec(
+            "registration", 2, {"reg_no": (100, 199), "batch_code": (1, 9)}
+        ),
+        "inspection_report": spec(
+            "inspection_report",
+            2,
+            {"report_id": (5000, 5999), "registration_no": (8000, 8999), "result_code": (1, 9)},
+        ),
+        "bystander": spec("bystander", 3, {"id": (1, 20)}),
+    }
+    with pytest.raises(Unsatisfiable) as exc:
+        Generator(schemas, specs).solve()
+    unsat = exc.value
+    assert [g.refs[0] for g in unsat.row_groups] == ["inspection_report"]
+    kinds = {g.kind for g in unsat.groups}
+    assert "fk" in kinds and "range" in kinds
+
+
+def test_relaxed_probe_treats_row_count_as_variable():
+    # Direct probe check: relaxing the empty parent's count must make the
+    # otherwise-unsat instance satisfiable (it may choose any k in [0, max]).
+    parent, child = _parent_child_schemas()
+    schemas = {"registration": parent, "inspection_report": child}
+    specs = {
+        "registration": spec(
+            "registration", 0, {"reg_no": (8000, 8999), "batch_code": (1, 99)}
+        ),
+        "inspection_report": spec(
+            "inspection_report",
+            1,
+            {"report_id": (5000, 5999), "registration_no": (8000, 8999), "result_code": (1, 9)},
+        ),
+    }
+    gen = Generator(schemas, specs)
+    gen._build_cells()
+    labelled = gen._hard_constraints()
+    import z3 as _z3
+
+    assert gen._probe_with_relaxed_counts({"rows:registration"}) == _z3.sat
+    # Relaxing only the child count cannot help: an empty referenced table
+    # means even one non-NULL FK value has nowhere to point... but a relaxed
+    # child may choose k=0 rows, which IS feasible.
+    assert gen._probe_with_relaxed_counts({"rows:inspection_report"}) == _z3.sat
+    # Relaxing nothing reproduces the proven infeasibility.
+    assert gen._probe_with_relaxed_counts(set()) == _z3.unsat
+
+
+def test_timeout_in_row_diagnosis_keeps_proven_unsat(monkeypatch):
+    # Force every diagnostic probe to time out. The Unsatisfiable verdict and
+    # its constraint core must survive; only the row-count localisation is
+    # flagged as unfinished.
+    parent, child = _parent_child_schemas()
+    schemas = {"registration": parent, "inspection_report": child}
+    specs = {
+        "registration": spec(
+            "registration", 0, {"reg_no": (8000, 8999), "batch_code": (1, 99)}
+        ),
+        "inspection_report": spec(
+            "inspection_report",
+            1,
+            {"report_id": (5000, 5999), "registration_no": (8000, 8999), "result_code": (1, 9)},
+        ),
+    }
+    import z3 as _z3
+
+    monkeypatch.setattr(
+        solver_mod.Generator,
+        "_probe_with_relaxed_counts",
+        lambda self, keys: _z3.unknown,
+    )
+    with pytest.raises(Unsatisfiable) as exc:
+        Generator(schemas, specs).solve()
+    unsat = exc.value
+    assert unsat.row_diagnosis == "timed_out"
+    # Undecided counts are retained conservatively (never silently dropped),
+    # while the proven constraint core still carries the no-solution verdict.
+    assert {g.refs[0] for g in unsat.row_groups} == {
+        "registration",
+        "inspection_report",
+    }
+    assert {g.kind for g in unsat.groups} >= {"fk", "range"}

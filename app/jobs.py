@@ -6,6 +6,7 @@ report and logs, never a partial package.
 """
 from __future__ import annotations
 
+import queue
 import threading
 import time
 import uuid
@@ -83,10 +84,55 @@ class JobStore:
 STORE = JobStore()
 
 
-def _conflict_from_groups(groups) -> ConflictReport:
+class JobQueue:
+    """Process-wide serial executor for generation jobs.
+
+    z3's native context is a process-global C++ object that is not safe when
+    driven from multiple OS threads (observed double-free / segfault when two
+    FastAPI background threads solve concurrently). Every job is therefore
+    handed to one long-lived worker thread, guaranteeing that all z3 calls in
+    the process happen on a single thread. The HTTP event loop is never
+    blocked: ``submit`` only enqueues and returns immediately.
+    """
+
+    def __init__(self) -> None:
+        self._q: queue.Queue[tuple[str, GenerateRequest]] = queue.Queue()
+        self._worker = threading.Thread(
+            target=self._consume, name="job-worker", daemon=True
+        )
+        self._worker.start()
+
+    def submit(self, job_id: str, req: GenerateRequest) -> None:
+        self._q.put((job_id, req))
+
+    def _consume(self) -> None:
+        while True:
+            job_id, req = self._q.get()
+            try:
+                run_job(job_id, req)
+            except Exception as exc:  # defensive: worker must never die
+                STORE.append_log(
+                    job_id, f"worker error: {exc.__class__.__name__}: {exc}"
+                )
+            finally:
+                self._q.task_done()
+
+
+QUEUE = JobQueue()
+
+
+def _conflict_from_groups(unsat: Unsatisfiable) -> ConflictReport:
+    groups = unsat.groups
+    row_groups = unsat.row_groups
     kinds = sorted({g.kind for g in groups})
-    table_hint = sorted({r for g in groups for r in g.refs if r})
+    if row_groups:
+        kinds = sorted(set(kinds) | {"rows"})
+    table_hint = sorted({r for g in [*groups, *row_groups] for r in g.refs if r})
+    # Proven core constraints first (ranges/nullability, unique, FK), then the
+    # row counts proven to participate, so row counts never silently replace
+    # the constraint-level explanation.
     lines = [g.label for g in groups]
+    lines.extend(g.label for g in row_groups if g not in groups)
     summary = "、".join(
         {
             "rows": "行数",
@@ -97,13 +143,31 @@ def _conflict_from_groups(groups) -> ConflictReport:
         }.get(k, k)
         for k in kinds
     )
+    details: dict = {"conflicting_constraints": lines, "kinds": kinds}
+    details["conflicting_row_counts"] = [
+        {"table": g.refs[0], "label": g.label} for g in row_groups
+    ]
+    if unsat.row_diagnosis == "timed_out":
+        # Infeasibility itself is proven; only the row-count localisation is
+        # unfinished. The report must not pretend the retained counts are all
+        # confirmed participants.
+        details["row_count_diagnosis"] = (
+            "timed_out：无解已由上述约束证实；行数定位在限时内未完成，"
+            "所列行数为保守保留（尚未逐一完成反事实验证），"
+            "未列出的表不代表其行数与冲突无关"
+        )
+    else:
+        details["row_count_diagnosis"] = (
+            "complete：仅列出经反事实验证参与冲突的表行数；未列出的表即使在"
+            "允许行数区间内增减行数，下述行数仍足以判定无解"
+        )
     return ConflictReport(
         kind="no_solution",
         message=(
             f"无解：以下{summary}约束相互冲突，不存在同时满足指定行数、区间与全部约束的样本。"
             f"涉及对象: {', '.join(table_hint) if table_hint else '(见详情)'}"
         ),
-        details={"conflicting_constraints": lines, "kinds": kinds},
+        details=details,
     )
 
 
@@ -195,7 +259,7 @@ def run_job(job_id: str, req: GenerateRequest) -> None:
             # Step 4: closure-added tables get bounded default specs so the
             # solver still constrains every cell, while user tables keep the
             # exact requested row counts and intervals.
-            from .models import IntRange, TableSpec, TYPE_BOUNDS
+            from .models import TYPE_BOUNDS, IntRange, TableSpec
 
             spec_by_name = {s.table: s for s in req.tables}
             for t in selected:
@@ -221,14 +285,24 @@ def run_job(job_id: str, req: GenerateRequest) -> None:
         specs = {s.table: s for s in req.tables}
 
         store.append_log(job_id, "solving constraints with z3 (hard: rows, ranges, PK/UK/FK)")
-        gen = Generator({t: schemas[t] for t in selected}, specs)
+        gen = Generator(
+            {t: schemas[t] for t in selected},
+            specs,
+            max_rows=settings.max_rows_per_table,
+        )
         try:
             data = gen.solve()
         except Unsatisfiable as unsat:
+            report = _conflict_from_groups(unsat)
+            if unsat.row_diagnosis == "timed_out":
+                store.append_log(
+                    job_id,
+                    "unsat proven; row-count diagnosis timed out (partial report)",
+                )
             store.update(
                 job_id,
                 status=JobStatus.FAILED,
-                conflict=_conflict_from_groups(unsat.groups),
+                conflict=report,
             )
             return
         except SolverTimeout as exc:
@@ -239,7 +313,12 @@ def run_job(job_id: str, req: GenerateRequest) -> None:
                 conflict=ConflictReport(
                     kind="solver_timeout",
                     message=str(exc),
-                    details={"note": "这不是无解结论，而是限时内未能判定"},
+                    details={
+                        "note": (
+                            "这不是无解结论，而是限时内未能判定；不会给出未经证实的冲突行数，"
+                            "请缩小行数/区间或表数量后重试"
+                        )
+                    },
                 ),
             )
             return

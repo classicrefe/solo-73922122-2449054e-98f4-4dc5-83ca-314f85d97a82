@@ -91,6 +91,39 @@ def test_unsat_reports_conflicting_rows_ranges_or_constraints():
     assert "fk" in conflict["details"]["kinds"]
 
 
+def test_zero_parent_rows_report_names_both_row_counts_and_fk():
+    # Worked example from the task: one inspection_report row with a NOT NULL
+    # FK into a registration table generated with zero rows.
+    jid, job = _run(_load("request_zero_parent_rows.json"))
+    assert job.status == JobStatus.FAILED
+    conflict = job.conflict.model_dump()
+    assert conflict["kind"] == "no_solution"
+    details = conflict["details"]
+    named = {row["table"] for row in details["conflicting_row_counts"]}
+    assert named == {"inspection_report", "registration"}
+    labels = " ".join(row["label"] for row in details["conflicting_row_counts"])
+    assert "inspection_report 恰好 1 行" in labels
+    assert "registration 恰好 0 行" in labels
+    joined = json.dumps(conflict, ensure_ascii=False)
+    # The foreign key stays part of the explanation; ranges/nullability too.
+    assert "inspection_report_reg_fk" in joined
+    assert "NOT NULL" in joined
+    assert set(details["kinds"]) >= {"rows", "fk", "range"}
+    # No package is ever published for a failed job.
+    assert STORE.package(jid) is None
+    assert details["row_count_diagnosis"].startswith("complete")
+
+
+def test_row_count_conflict_excludes_unselected_tables(source_dsn):
+    # The same unsat pair inside the full six-table catalog: closure of the
+    # two domain tables contains no other table, and even if other tables
+    # existed, their counts must not appear in the report.
+    jid, job = _run(_load("request_zero_parent_rows.json"))
+    joined = json.dumps(job.conflict.model_dump(), ensure_ascii=False)
+    for unrelated in ("dept", "employee", "project", "assignment"):
+        assert unrelated not in joined
+
+
 def test_fk_closure_expands_target_table():
     # Only project requested; the transitive FK closure pulls in dept and
     # employee (dept.mgr_emp -> employee), staying within the 4-table cap.
@@ -164,7 +197,14 @@ def test_validation_rejects_bad_interval(source_dsn):
     r = client.post("/jobs", json=req)
     if r.status_code == 202:
         jid = r.json()["job_id"]
-        job = STORE.get(jid)
+        # The job runs on the serial background worker; poll to a terminal state.
+        import time
+
+        for _ in range(100):
+            job = STORE.get(jid)
+            if job.status in (JobStatus.FAILED, JobStatus.SUCCEEDED):
+                break
+            time.sleep(0.1)
         assert job.status == JobStatus.FAILED
         assert job.conflict.kind == "request"
     else:

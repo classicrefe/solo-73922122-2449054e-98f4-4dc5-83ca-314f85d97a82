@@ -54,3 +54,18 @@ def fresh_verify_database(verify_dsn):
             )
     except psycopg.Error:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _drain_job_queue():
+    """Wait for the serial job worker to finish between tests.
+
+    Most tests invoke ``run_job`` synchronously, but a couple go through the
+    HTTP endpoint which enqueues onto the single background worker. Without
+    draining, a later test could observe a job still in GENERATING.
+    """
+    from app.jobs import QUEUE
+
+    QUEUE._q.join()
+    yield
+    QUEUE._q.join()

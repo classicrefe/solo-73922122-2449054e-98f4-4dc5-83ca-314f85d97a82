@@ -1,0 +1,23 @@
+{
+  "_comment": "无解示例（行数冲突）：检验报告 inspection_report 指定生成 1 行，其必填列 registration_no（NOT NULL 外键）引用登记表 registration，而 registration 被指定生成 0 行，外键无可匹配的键，必然无解。冲突报告须同时列出两张表的原定行数与该外键，并排除任何未点名表的行数。",
+  "schema_name": "public",
+  "tables": [
+    {
+      "table": "inspection_report",
+      "rows": 1,
+      "ranges": {
+        "report_id":       {"low": 5000, "high": 5999},
+        "registration_no": {"low": 8000, "high": 8999},
+        "result_code":     {"low": 1,    "high": 9}
+      }
+    },
+    {
+      "table": "registration",
+      "rows": 0,
+      "ranges": {
+        "reg_no":     {"low": 8000, "high": 8999},
+        "batch_code": {"low": 1,    "high": 99}
+      }
+    }
+  ]
+}

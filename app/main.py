@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, Response
 
 from .config import settings
@@ -25,7 +25,7 @@ from .introspect import (
     introspect_tables,
     list_base_tables,
 )
-from .jobs import STORE, package_zip, run_job
+from .jobs import QUEUE, STORE, package_zip
 from .models import GenerateRequest, JobStatus
 
 
@@ -92,7 +92,7 @@ def table_structure(schema: str, table: str):
 
 
 @app.post("/jobs", tags=["jobs"], status_code=202)
-def create_job(req: GenerateRequest, background: BackgroundTasks):
+def create_job(req: GenerateRequest):
     if not req.tables:
         raise HTTPException(422, "tables 不能为空")
     if len({t.table for t in req.tables}) != len(req.tables):
@@ -102,7 +102,8 @@ def create_job(req: GenerateRequest, background: BackgroundTasks):
             422, f"至多选择 {settings.max_tables} 张表（不含外键闭包扩展）"
         )
     job_id = STORE.create()
-    background.add_task(run_job, job_id, req)
+    # Hand off to the single serial worker thread; the event loop stays free.
+    QUEUE.submit(job_id, req)
     return {"job_id": job_id, "status": JobStatus.PENDING.value}
 
 

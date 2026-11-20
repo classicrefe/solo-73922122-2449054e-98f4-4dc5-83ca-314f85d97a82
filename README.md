@@ -29,7 +29,10 @@
 - 验证在独立的验证集群上为每个作业新建隔离空库，结束后删除；
 - 不关闭任何约束、不把即时约束改写为延迟约束；循环外键通过「先建表→插数据→
   再 `ALTER TABLE ADD CONSTRAINT`」的结构方式装载；
-- 失败不产出、不提供任何部分包，下载仅在 `SUCCEEDED` 后可用。
+- 失败不产出、不提供任何部分包，下载仅在 `SUCCEEDED` 后可用；
+- 所有作业经单一线程的串行工作队列执行：z3 原生上下文为进程级全局对象，
+  多线程并发驱动会触发原生崩溃，串行化保证同一时刻只有一个作业在求解，
+  HTTP 事件循环本身不被阻塞（提交接口仅入队后立即返回 202）。
 
 ## 一键启动（Docker Compose）
 
@@ -80,6 +83,11 @@ docker compose up --build
   闭包后仍不得超过 4 张，否则以 `closure` 冲突明确拒绝。
 - 闭包自动带入的表按其整数类型边界取默认区间、默认 5 行。
 - 无解时返回 `kind=no_solution`，并给出参与冲突的具体行数/区间/约束清单。
+  行数冲突采用**逐表反事实验证**定位：仅当把某张表的行数放宽到允许区间
+  `[0, MAX_ROWS_PER_TABLE]` 内任意取值、其余约束原样保留仍无法恢复可行时，
+  才把该表行数计入冲突；因此未点名的表即使在允许范围内增减行数，报告点名
+  的行数也足以判定无解，无关表的行数不会出现。若诊断阶段超时，无解结论
+  （由约束核心证实）仍然保留，报告标注 `timed_out` 并说明尚未定位冲突行数。
 
 ### 下载包内容
 
@@ -114,6 +122,23 @@ assignment(emp_id,project_id) → employee / project              复合主键+�
 `examples/request_unsat_conflict.json`；闭包扩展示例见
 `examples/request_closure_single.json`。
 
+## 行数冲突无解示例（检验报告 → 登记表）
+
+`inspection_report`（检验报告）指定生成 1 行，其**必填**列
+`registration_no` 是 NOT NULL 外键，引用 `registration`（登记表）；
+而登记表被指定生成 **0 行**，外键没有任何可匹配的键，必然无解：
+
+```
+inspection_report.registration_no (NOT NULL) ──► registration.reg_no
+        恰好 1 行                                          恰好 0 行
+```
+
+请求见 `examples/request_zero_parent_rows.json`。冲突报告会同时列出
+两张表的原定行数与该外键（区间、可空性、主键/唯一键一并保留），并通过
+`details.conflicting_row_counts` 单独给出参与冲突的行数；未点名的表
+（如 `dept`/`employee` 等）即使在允许行数区间内增减，也不会被列入，
+点名的行数本身已足以判定无解。失败作业不产出任何部分包，下载返回 409。
+
 ## 本地自测（无需 Docker）
 
 仓库测试用 `pgserver` 自带的 PostgreSQL 二进制在本机起两个实例：
@@ -137,8 +162,8 @@ PYTHONPATH=. .venv/bin/python -m pytest tests/
 
 ```
 app/            FastAPI + 内省 + z3 求解 + SQL 渲染 + 隔离库验证
-sql/            循环引用检验表源结构、源库初始化（只读角色）
-examples/       循环四表、无解冲突、闭包扩展三类请求示例
-tests/          34 个单元/集成/端到端测试（真实 PostgreSQL）
+sql/            循环引用检验表 + 检验报告/登记表源结构、源库初始化（只读角色）
+examples/       循环四表、无解冲突、闭包扩展、零行父表行数冲突四类请求示例
+tests/          44 个单元/集成/端到端测试（真实 PostgreSQL）
 docker-compose.yml / Dockerfile / requirements.txt
 ```

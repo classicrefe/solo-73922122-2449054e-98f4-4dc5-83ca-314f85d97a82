@@ -16,6 +16,7 @@ row count, range or constraint that participates in the conflict.
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 
 import z3
@@ -29,6 +30,13 @@ from .models import (
 
 NULL_MARKER = None
 Row = dict[str, int | None]
+
+#: z3's native solver context is not safe when multiple Python threads drive
+#: independent Solver objects concurrently (observed C++ assertion failures /
+#: segfaults under parallel background jobs). All z3 interaction in a process
+#: is serialised behind this lock; the HTTP event loop itself stays free
+#: because solving only happens inside job worker threads.
+Z3_LOCK = threading.RLock()
 
 
 @dataclass
@@ -47,8 +55,19 @@ class Group:
 
 
 class Unsatisfiable(Exception):
-    def __init__(self, groups: list[Group]):
+    def __init__(
+        self,
+        groups: list[Group],
+        row_groups: list[Group] | None = None,
+        row_diagnosis: str = "complete",
+    ):
         self.groups = groups
+        # Row-count groups proven to participate in the conflict. Empty when no
+        # row count is part of the explanation; see ``row_diagnosis``.
+        self.row_groups = row_groups or []
+        # "complete": every table was decided; "timed_out": infeasibility is
+        # proven by the core above, but the row-count analysis could not finish.
+        self.row_diagnosis = row_diagnosis
         super().__init__("; ".join(g.label for g in groups))
 
 
@@ -61,9 +80,20 @@ class SolverTimeout(Exception):
 
 
 class Generator:
-    def __init__(self, schemas: dict[str, TableSchema], specs: dict):
+    #: Per-probe time budget for the counterfactual row-count diagnosis.
+    PROBE_TIMEOUT_MS = 15000
+
+    def __init__(
+        self,
+        schemas: dict[str, TableSchema],
+        specs: dict,
+        max_rows: int = 20,
+    ):
         self.schemas = schemas
         self.specs = specs  # table name -> TableSpec
+        # Allowed row-count band; relaxed probes may vary a table's cardinality
+        # anywhere in [0, max_rows], matching the request-level contract.
+        self.max_rows = max_rows
         self.cells: dict[str, list[list[Cell]]] = {}
         self.groups: list[Group] = []
         self._group_keys: set[str] = set()
@@ -190,7 +220,7 @@ class Generator:
             n = self.specs[tname].rows
             g = self._group(
                 f"rows:{tname}",
-                f"行数约束：表 {tname} 恰好 {n} 行（0～20）",
+                f"行数约束：表 {tname} 恰好 {n} 行（允许区间 0～{self.max_rows}）",
                 "rows",
                 [tname],
             )
@@ -246,6 +276,11 @@ class Generator:
 
     # ------------------------------------------------------------------ solve
     def solve(self) -> dict[str, list[Row]]:
+        # Single entry point for all z3 work; serialised process-wide.
+        with Z3_LOCK:
+            return self._solve_locked()
+
+    def _solve_locked(self) -> dict[str, list[Row]]:
         self._build_cells()
         labelled = self._hard_constraints()
 
@@ -265,7 +300,18 @@ class Generator:
             )
         # Decided unsatisfiable: obtain and minimise an unsat core.
         core_groups = self._unsat_core(labelled)
-        raise Unsatisfiable(core_groups)
+        # Separately decide which requested row counts participate in the
+        # conflict. The labelled core above never contains a rows group (the
+        # row count is encoded structurally, its marker is TRUE), so without
+        # this pass the report would miss the row counts entirely.
+        row_groups, row_status = self._diagnose_row_counts(labelled)
+        if row_status == "timed_out":
+            # Infeasibility itself is already proven; keep the verdict but say
+            # honestly that the conflicting row counts are not yet localised.
+            raise Unsatisfiable(
+                core_groups, row_groups=row_groups, row_diagnosis="timed_out"
+            )
+        raise Unsatisfiable(core_groups, row_groups=row_groups)
 
     def _attempt(
         self, labelled: list[tuple[Group, z3.BoolRef]], prefer_non_null: bool
@@ -349,6 +395,185 @@ class Generator:
             #            rather than silently dropping a real conflict.
             essential.append(key)
         return essential
+
+    # ------------------------------------------------- row-count conflict probe
+    def _diagnose_row_counts(
+        self, labelled: list[tuple[Group, z3.BoolRef]]
+    ) -> tuple[list[Group], str]:
+        """Locate the row counts that participate in the proven infeasibility.
+
+        Per-table counterfactual test: a table's requested row count
+        participates in the conflict iff allowing *that table alone* to vary
+        its cardinality anywhere in the allowed ``[0, max_rows]`` band —
+        while every other table keeps its exact requested count and every
+        range, nullability, key and foreign-key constraint stays exactly as
+        requested — is not enough to restore feasibility.
+
+        Soundness: a pruned table's count can never be needed to argue
+        infeasibility, because the probe exhibited a concrete alternative
+        cardinality (within the allowed band) for it under which the rest of
+        the system is feasible. Hence the retained counts fixed at their
+        requested values still prove the instance unsat even if every pruned
+        table varies within its band — and unrelated tables never appear.
+
+        Returns ``(row_groups, status)`` where status is ``"complete"`` or
+        ``"timed_out"``. On timeout the infeasibility verdict still stands
+        (it was already proven by the main solver); only the row-count
+        localisation is reported as unfinished, and the undecided counts are
+        kept conservatively rather than silently dropped.
+        """
+        row_keys = [f"rows:{t}" for t in self.schemas]
+        row_group = {
+            g.key: g
+            for g, _ in labelled
+            if g.kind == "rows"
+        }
+        essential: list[str] = []
+        timed_out = False
+        for key in row_keys:
+            verdict = self._probe_with_relaxed_counts({key})
+            if verdict == z3.sat:
+                # Relaxing this count alone yields a feasible system: the
+                # requested count is what blocks feasibility, name it.
+                essential.append(key)
+            elif verdict == z3.unknown:
+                # Cannot decide within budget. Keep the count conservatively
+                # and flag the whole diagnosis as partial.
+                timed_out = True
+                essential.append(key)
+            # unsat: even a free cardinality for this table cannot save the
+            # instance, so its count is irrelevant to the conflict; prune it.
+        groups = [row_group[k] for k in row_keys if k in essential]
+        return groups, ("timed_out" if timed_out else "complete")
+
+    def _probe_with_relaxed_counts(self, relaxed_keys: set[str]) -> z3.CheckSatResult:
+        """Re-encode the whole instance with some cardinalities relaxed.
+
+        Every relaxed table gets ``max_rows + 1`` cell slots guarded by an
+        ``active`` predicate: the first ``k`` slots encode the table's actual
+        cardinality for some freely chosen ``k`` in ``[0, max_rows]``. All
+        other constraints (closed intervals, NOT NULL placement, SQL UNIQUE
+        semantics, MATCH SIMPLE/FULL foreign keys, self references and cycles)
+        are reproduced verbatim over active cells, so relaxing a cardinality
+        weakens nothing but the row count itself.
+        """
+        s = z3.Solver()
+        s.set(timeout=self.PROBE_TIMEOUT_MS)
+        relaxed_tables = {k.split(":", 1)[1] for k in relaxed_keys}
+        cap: dict[str, int] = {}
+        cells: dict[str, list[list[Cell]]] = {}
+        active: dict[str, list[z3.BoolRef]] = {}
+        for tname, ts in self.schemas.items():
+            n_req = self.specs[tname].rows
+            if tname in relaxed_tables:
+                n_cap = self.max_rows
+                act = [z3.Bool(f"probe_{tname}_active_{r}") for r in range(n_cap)]
+                # Cardinality k = number of active slots, with a prefix shape
+                # (slot r active implies all earlier slots active).
+                for r in range(1, n_cap):
+                    s.add(z3.Implies(act[r], act[r - 1]))
+                active[tname] = act
+            else:
+                n_cap = n_req
+                active[tname] = [z3.BoolVal(True) for _ in range(n_cap)]
+            cap[tname] = n_cap
+            table_cells: list[list[Cell]] = []
+            for r in range(n_cap):
+                row_cells = []
+                for col in ts.columns:
+                    v = z3.Int(f"probe_{tname}_{r}_{col.name}__v")
+                    nu = z3.Bool(f"probe_{tname}_{r}_{col.name}__null")
+                    row_cells.append(Cell(value=v, isnull=nu, col=col))
+                table_cells.append(row_cells)
+            cells[tname] = table_cells
+
+        # Range / nullability constraints, restricted to active rows.
+        for tname, ts in self.schemas.items():
+            spec = self.specs[tname]
+            idx = {c.name: i for i, c in enumerate(ts.columns)}
+            for r, row in enumerate(cells[tname]):
+                guard = active[tname][r]
+                for col in ts.columns:
+                    rng = spec.ranges[col.name]
+                    cell = row[idx[col.name]]
+                    if not col.nullable:
+                        s.add(z3.Implies(guard, cell.isnull == False))  # noqa: E712
+                    s.add(
+                        z3.Implies(
+                            z3.And(guard, cell.isnull == False),  # noqa: E712
+                            z3.And(cell.value >= rng.low, cell.value <= rng.high),
+                        )
+                    )
+
+        # Unique constraints over pairs of active rows (SQL NULL semantics).
+        for tname, ts in self.schemas.items():
+            rows = cells[tname]
+            idx = {c.name: i for i, c in enumerate(ts.columns)}
+            for uc in ts.unique_constraints:
+                for i in range(len(rows)):
+                    for j in range(i + 1, len(rows)):
+                        both_active = z3.And(active[tname][i], active[tname][j])
+                        any_null, diffs = [], []
+                        for cname in uc.columns:
+                            a, b = rows[i][idx[cname]], rows[j][idx[cname]]
+                            any_null.append(z3.Or(a.isnull, b.isnull))
+                            diffs.append(a.value != b.value)
+                        s.add(
+                            z3.Implies(
+                                z3.And(both_active, z3.Not(z3.Or(*any_null))),
+                                z3.Or(*diffs),
+                            )
+                        )
+
+        # Foreign keys over active rows; inactive referenced rows cannot match.
+        for tname, ts in self.schemas.items():
+            rows = cells[tname]
+            idx = {c.name: i for i, c in enumerate(ts.columns)}
+            for fk in ts.foreign_keys:
+                ref_ts = self.schemas[fk.ref_table]
+                ridx = {c.name: i for i, c in enumerate(ref_ts.columns)}
+                ref_rows = cells[fk.ref_table]
+                for r, row in enumerate(rows):
+                    local = [row[idx[c]] for c in fk.columns]
+                    any_null = z3.Or(*[c.isnull for c in local])
+                    all_null = z3.And(*[c.isnull for c in local])
+                    matches = []
+                    for rr_i, rr in enumerate(ref_rows):
+                        ref_active = active[fk.ref_table][rr_i]
+                        per_col = [
+                            z3.And(
+                                ref_active,
+                                lc.isnull == False,  # noqa: E712
+                                rc.isnull == False,  # noqa: E712
+                                lc.value == rc.value,
+                            )
+                            for lc, rc in zip(
+                                local,
+                                [rr[ridx[c]] for c in fk.ref_columns],
+                            )
+                        ]
+                        matches.append(z3.And(*per_col))
+                    has_match = z3.Or(*matches) if matches else z3.BoolVal(False)
+                    if len(local) == 1 or fk.match.value == "MATCH SIMPLE":
+                        s.add(
+                            z3.Implies(
+                                z3.And(active[tname][r], z3.Not(any_null)),
+                                has_match,
+                            )
+                        )
+                    else:  # MATCH FULL
+                        s.add(
+                            z3.Implies(
+                                z3.And(active[tname][r], any_null), all_null
+                            )
+                        )
+                        s.add(
+                            z3.Implies(
+                                z3.And(active[tname][r], z3.Not(any_null)),
+                                has_match,
+                            )
+                        )
+        return s.check()
 
     def _extract(self, model: z3.ModelRef) -> dict[str, list[Row]]:
         out: dict[str, list[Row]] = {}

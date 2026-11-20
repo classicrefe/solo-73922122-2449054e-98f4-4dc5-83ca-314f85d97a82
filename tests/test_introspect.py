@@ -15,7 +15,14 @@ from app.introspect import (
 def test_lists_only_base_tables(source_dsn):
     with source_connection(source_dsn) as conn:
         base, others = list_base_tables(conn, "public")
-    assert set(base) == {"dept", "employee", "project", "assignment"}
+    assert set(base) == {
+        "dept",
+        "employee",
+        "project",
+        "assignment",
+        "registration",
+        "inspection_report",
+    }
     assert others == []
 
 
